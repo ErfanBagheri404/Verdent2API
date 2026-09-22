@@ -18,6 +18,20 @@ BANNER = r"""
 DEFAULT_HOST = "localhost"
 DEFAULT_PORT = 61023
 
+def usage_windows():
+    """Free/Eco window ratios from the account API (same call the app makes)."""
+    tok = A.get_token()
+    if not tok:
+        return None
+    req = urllib.request.Request(
+        "https://api.verdent.ai/verdent/usage_windows?team_id=0",
+        headers={"Authorization": "Bearer " + tok, "User-Agent": "Verdent/2.15.1"})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return json.load(r).get("data") or {}
+    except Exception:
+        return None
+
 def cmd_status():
     a = A.load_auth()
     if not a:
@@ -29,6 +43,14 @@ def cmd_status():
     print(f"  User       : {a.get('user_id') or 'n/a'}")
     print(f"  Expires in : {left:.1f} h")
     print(f"  Store      : {A.AUTH_PATH}")
+    w = usage_windows()
+    if w:
+        for name in ("free_mode", "eco_mode"):
+            m = w.get(name) or {}
+            used5 = m.get("ratio_5h", 0)
+            used7 = m.get("ratio_7d", 0)
+            print(f"  {name:<10} : used {used5:.1f}% /5h, {used7:.1f}% /7d, "
+                  f"available={m.get('is_available')}")
 
 def cmd_models():
     from server import catalog_models, model_object
