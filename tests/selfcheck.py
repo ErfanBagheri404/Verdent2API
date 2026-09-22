@@ -45,15 +45,23 @@ from client import build_body, is_free_model, _headers
 t("is_free suffix", is_free_model("glm-5.3-flash-free") is True)
 t("is_free paid", is_free_model("glm-5.3-flash") is False)
 b = build_body("deepseek-v4.1-flash-free",
-               [{"role": "user", "content": "hi"}], "sys", "id1")
+               [{"role": "user", "content": "hi"}], None, "id1")
 t("body has encrypt flag", b["encrypt"] is True)
-t("body is_free for -free model", b["is_free"] is True)
+t("body uses fingerprinted app system blob", len(b["system"]) > 20000)
+t("body is_free mirrors app (false)", b["is_free"] is False)
 t("body session/conv prefix", b["session_id"].startswith("session_")
   and b["conv_id"].startswith("conv_"))
 t("body messages decryptable", decrypt_blob(b["messages"])[0]["content"] == "hi")
+bsys = build_body("glm-5.3-flash-free",
+                  [{"role": "system", "content": "be terse"},
+                   {"role": "user", "content": "hi"}], "extra", "id2")
+inner = decrypt_blob(bsys["messages"])
+t("client system folded into first user msg",
+  inner[0]["role"] == "user" and "be terse" in inner[0]["content"]
+  and "extra" in inner[0]["content"] and "<system>" in inner[0]["content"])
 h = _headers("tok")
 t("headers carry beta marker", h["verdent-proxy-beta"].startswith("hybrid-stream"))
-t("headers carry agent_type", h["agent_type"] == "ts_agent")
+t("headers carry X-Team-ID", h["X-Team-ID"] == "0")
 
 import server as S
 S._server_api_key = None

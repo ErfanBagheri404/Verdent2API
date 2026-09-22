@@ -1,5 +1,5 @@
 """Verdent upstream client: builds /llm/stream envelopes, parses hybrid-stream responses."""
-import json, uuid, datetime, urllib.request, urllib.error
+import json, uuid, datetime, os, urllib.request, urllib.error
 
 from crypto import encrypt_obj
 
@@ -15,16 +15,27 @@ class UpstreamError(Exception):
         self.payload = payload
 
 def _headers(token: str) -> dict:
+    # exact header set the desktop app's HttpAiProvider sends to /llm/stream
+    import subprocess
+    machine_guid = "012c8d596e14c8623f58f2add22f28b5"
+    try:
+        out = subprocess.run(
+            ["reg", "query", r"HKLM\SOFTWARE\Microsoft\Cryptography", "/v", "MachineGuid"],
+            capture_output=True, text=True, timeout=5).stdout
+        for line in out.splitlines():
+            if "MachineGuid" in line:
+                machine_guid = line.split()[-1]
+    except Exception:
+        pass
     return {
-        "content-type": "application/json",
-        "authorization": " ".join(["Bearer", token]),
-        "cookie": "".join(["token=", token]),
+        "Authorization": "Bearer " + token,
+        "Content-Type": "application/json",
         "verdent-proxy-beta": BETA,
-        "OS": "win32", "CPU-Arch": "x64", "agent_type": "ts_agent",
+        "X-Device-Id": machine_guid,
         "X-Version-Code": "2.15.1",
-        "X-Device-ID": "012c8d596e14c8623f58f2add22f28b5",
-        "X-Device-Type": "desktop", "X-OS-Type": "windows",
-        "User-Agent": UA,
+        "X-Team-ID": "0",
+        "X-Device-Type": "pc",
+        "X-OS-Type": "windows",
     }
 
 def is_free_model(model: str) -> bool:
@@ -44,32 +55,60 @@ def _catalog_flags(model):
         pass
     return is_limit_free
 
-def build_body(model, messages, system, token_id, max_tokens=4096,
+_TEMPLATE = None
+
+def _template():
+    """App-captured request template.
+
+    The gateway fingerprints the `system` field: it must be the desktop app's
+    own encrypted agent prompt (any replacement lands in the strict 20004
+    rate lane). Everything else (ids, model, messages, env) is free-form.
+    Regenerate template.json from capture.py when the app updates its prompt.
+    ponytail: client system prompts ride inside `messages`, not body.system.
+    """
+    global _TEMPLATE
+    if _TEMPLATE is None:
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "template.json"), encoding="utf-8") as f:
+            _TEMPLATE = json.load(f)
+    return _TEMPLATE
+
+
+def build_body(model, messages, system, token_id, max_tokens=None,
                temperature=None, stream=True):
-    sid = str(uuid.uuid4())
-    is_limit_free = _catalog_flags(model)
-    body = {
-        "channel": "deck",
+    t = _template()
+    # OpenAI `system` messages can't go in body.system (fingerprinted) —
+    # fold them into the conversation as a leading user-turn block.
+    msgs = []
+    sys_parts = [m["content"] for m in messages
+                 if m.get("role") == "system" and m.get("content")]
+    if system:
+        sys_parts.insert(0, system)
+    msgs = [m for m in messages if m.get("role") != "system"]
+    if sys_parts:
+        block = "<system>\n" + "\n\n".join(str(p) for p in sys_parts) + "\n</system>"
+        if msgs and msgs[0].get("role") == "user" and isinstance(msgs[0].get("content"), str):
+            msgs[0] = dict(msgs[0], content=block + "\n\n" + msgs[0]["content"])
+        else:
+            msgs.insert(0, {"role": "user", "content": block})
+    if not msgs:
+        msgs = [{"role": "user", "content": "Hello"}]
+
+    body = dict(t)
+    body.update({
         "model": model,
-        "session_id": "session_" + sid,
-        "conv_id": "conv_" + sid,
+        "session_id": "session_" + str(uuid.uuid4()),
+        "conv_id": "conv_" + str(uuid.uuid4()),
         "react_id": "model_agent_" + str(uuid.uuid4()),
         "react_type": "Main Agent",
-        "sub_type": "",
         "stream": stream,
-        "max_tokens": max_tokens,
-        "system": encrypt_obj(system or "You are a helpful assistant."),
-        "messages": encrypt_obj(messages),
-        "agent_name": "VerdentDeck",
-        "env": {"platform": "win32", "os_version": "", "shell": "",
-                "today_date": datetime.date.today().isoformat()},
-        "encrypt": True,
-        "is_eco": False,
-        "is_auto": False,
-        "is_free": is_free_model(model),
-        "is_limit_free": is_limit_free,
-        "native_api": False,
-    }
+        "max_tokens": max_tokens or t.get("max_tokens", 64000),
+        "messages": encrypt_obj(msgs),
+        "env": dict(t["env"], today_date=datetime.date.today().isoformat()),
+    })
+    body.pop("tools", None)
+    body.pop("tool_choice", None)
+    body.pop("sub_type", None)
     if temperature is not None:
         body["temperature"] = temperature
     return body

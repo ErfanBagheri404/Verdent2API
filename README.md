@@ -12,6 +12,24 @@ client that speaks `/v1/chat/completions` (9router, LobeChat, Open WebUI, SDKs..
 - Streaming responses translated from Verdent's `hybrid-stream` SSE to OpenAI chunks
 - `tool_calls` and `reasoning_content` preserved
 
+## How it passes the gateway
+
+Verdent's gateway fingerprints the encrypted `system` field: it must carry the
+desktop app's own agent prompt (captured once into `template.json`). Any
+custom system prompt lands in a strict `20004` rate lane, so OpenAI-style
+`system` messages are folded into the first user message instead. If Verdent
+ships a new app version and requests start 429ing, regenerate:
+
+```sh
+python capture_app_request.py 61024          # in a second shell
+# set ~/.verdent/config.json  internal.llmProxy = http://127.0.0.1:61024
+# (or relaunch app with VERDENT_LLM_PROXY_BASE_URL=http://127.0.0.1:61024)
+# send one prompt in the app, then restore the config (capture_app_request
+# prints instructions; body is captured to capture.log — copy its `system`,
+# `thinking`, `effort`, `max_tokens`, `temperature`, `model_catalog_version`
+# into template.json and restore config.json from its .bak)
+```
+
 > Open source, for maintenance/education. You are responsible for complying
 > with Verdent's Terms of Service.
 
