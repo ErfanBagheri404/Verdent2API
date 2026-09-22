@@ -46,21 +46,19 @@ jobs:
         with: {python-version: "3.11"}
       - run: pip install cryptography pyinstaller
       - run: pyinstaller --onefile --name Verdent2API main.py
-      - name: smoke test
+      - name: stage uniquely-named artifact
         shell: bash
         run: |
+          mkdir -p out
           if [ "$RUNNER_OS" = "Windows" ]; then
-            ./dist/Verdent2API.exe --help || true
+            cp dist/Verdent2API.exe "out/Verdent2API-${{ matrix.name }}.exe"
           else
-            chmod +x dist/Verdent2API
-            ./dist/Verdent2API --help || true
+            cp dist/Verdent2API "out/Verdent2API-${{ matrix.name }}"
           fi
       - uses: actions/upload-artifact@v4
         with:
           name: verdent2api-${{ matrix.name }}
-          path: |
-            dist/Verdent2API.exe
-            dist/Verdent2API
+          path: out/*
   release:
     needs: [version, build]
     runs-on: ubuntu-latest
@@ -70,8 +68,12 @@ jobs:
       - name: rename artifacts
         run: |
           cd dist
-          mv Verdent2API.exe Verdent2API-${{ needs.version.outputs.version }}-windows-amd64.exe || true
-          [ -f Verdent2API ] && mv Verdent2API Verdent2API-${{ needs.version.outputs.version }}-linux-amd64 || true
+          for f in *; do
+            case "$f" in
+              *.exe) mv "$f" "Verdent2API-${{ needs.version.outputs.version }}-${f#Verdent2API-}";;
+              *)     mv "$f" "Verdent2API-${{ needs.version.outputs.version }}-${f#Verdent2API-}";;
+            esac
+          done
           ls -la
       - uses: softprops/action-gh-release@v2
         with:
