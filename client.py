@@ -109,8 +109,37 @@ def _app_msg(m, last=False):
     return out
 
 
+def _conv_tools(tools):
+    """OpenAI tools -> app tools: [{name, description, input_schema}].
+    App sends its own 26 tools encrypted in exactly this shape."""
+    out = []
+    for t in tools or []:
+        if not isinstance(t, dict):
+            continue
+        f = t.get("function") if t.get("type") == "function" else t
+        if not f.get("name"):
+            continue
+        out.append({"name": f["name"], "description": f.get("description") or "",
+                    "input_schema": f.get("parameters")
+                    or {"type": "object", "properties": {}}})
+    return out or None
+
+
+def _conv_tool_choice(tc):
+    """tool_choice -> plain dict upstream (capture: {"type":"auto"}).
+    ponytail: 'none' maps to auto — gateway has no none; drop tools instead."""
+    if isinstance(tc, dict):
+        if tc.get("type") == "function":
+            nm = (tc.get("function") or {}).get("name")
+            return {"type": "tool", "name": nm} if nm else {"type": "auto"}
+        return {"type": "any"} if tc.get("type") == "any" else {"type": "auto"}
+    if tc == "required":
+        return {"type": "any"}
+    return {"type": "auto"}
+
+
 def build_body(model, messages, system, token_id, max_tokens=None,
-               temperature=None, stream=True):
+               temperature=None, stream=True, tools=None, tool_choice=None):
     t = _template()
     # OpenAI `system` messages can't go in body.system (fingerprinted) —
     # fold them into the conversation as a leading user-turn block.
@@ -119,6 +148,33 @@ def build_body(model, messages, system, token_id, max_tokens=None,
     if system:
         sys_parts.insert(0, system)
     msgs = [m for m in messages if m.get("role") != "system"]
+    # Agentic history: app has no tool-call blocks — render assistant
+    # tool_calls and tool results as text so the model sees its own calls.
+    id2name = {}
+    for m in msgs:
+        for tx in (m.get("tool_calls") or []):
+            if tx.get("id"):
+                id2name[tx["id"]] = (tx.get("function") or {}).get("name") or ""
+    norm = []
+    for m in msgs:
+        mm = dict(m)
+        c = mm.get("content")
+        if not isinstance(c, str):
+            c = json.dumps(c, ensure_ascii=False) if c is not None else ""
+            mm["content"] = c
+        if mm.get("role") == "assistant" and mm.get("tool_calls"):
+            parts = [c]
+            for tx in mm["tool_calls"]:
+                fn = tx.get("function") or {}
+                parts.append("[tool_call %s] %s" % (fn.get("name") or "",
+                                                    fn.get("arguments") or "{}"))
+            mm["content"] = "\n".join(p for p in parts if p)
+        elif mm.get("role") == "tool":
+            nm = id2name.get(mm.get("tool_call_id") or "", "")
+            mm = {"role": "user",
+                  "content": ("[tool_result %s]\n" % nm if nm else "[tool_result]\n") + c}
+        norm.append(mm)
+    msgs = norm
     if sys_parts:
         block = "<system>\n" + "\n\n".join(str(p) for p in sys_parts) + "\n</system>"
         if msgs and msgs[0].get("role") == "user" and isinstance(msgs[0].get("content"), str):
@@ -150,9 +206,11 @@ def build_body(model, messages, system, token_id, max_tokens=None,
         "messages": encrypt_obj(out_msgs),
         "env": dict(t["env"], today_date=datetime.date.today().isoformat()),
     })
-    body.pop("tools", None)
-    body.pop("tool_choice", None)
     body.pop("sub_type", None)
+    conv_tools = _conv_tools(tools)
+    if conv_tools:
+        body["tools"] = encrypt_obj(conv_tools)
+        body["tool_choice"] = _conv_tool_choice(tool_choice)
     if temperature is not None:
         body["temperature"] = temperature
     return body

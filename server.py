@@ -113,7 +113,9 @@ class Handler(BaseHTTPRequestHandler):
         system, rest = split_system(messages)
         body = build_body(model, rest, system, str(uuid.uuid4()),
                           max_tokens=int(req.get("max_tokens") or 4096),
-                          temperature=req.get("temperature"), stream=True)
+                          temperature=req.get("temperature"), stream=True,
+                          tools=req.get("tools"),
+                          tool_choice=req.get("tool_choice"))
         try:
             resp, reader = stream_request(token, body)
         except UpstreamError as e:
@@ -188,9 +190,9 @@ class Handler(BaseHTTPRequestHandler):
                     if t == "message_start":
                         usage_in = self._usage_in(obj) or usage_in
                     elif t == "content_block_start":
-                        blk = obj.get("content") or {}
+                        blk = obj.get("content_block") or obj.get("content") or {}
                         if blk.get("type") == "tool_use":
-                            tool_acc[blk.get("index", 0)] = {
+                            tool_acc[obj.get("index", blk.get("index", 0))] = {
                                 "id": blk.get("id") or "call_" + uuid.uuid4().hex[:12],
                                 "name": blk.get("name") or "", "args": ""}
                     elif t == "content_block_delta":

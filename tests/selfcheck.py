@@ -72,6 +72,33 @@ t("client system folded into first user msg",
 h = _headers("tok")
 t("headers carry beta marker", h["verdent-proxy-beta"].startswith("hybrid-stream"))
 t("headers carry X-Team-ID", h["X-Team-ID"] == "0")
+from crypto import encrypt_obj, decrypt_blob
+bt = build_body("glm-5.3-flash-free",
+                [{"role": "user", "content": "ls"}],
+                "", "id3",
+                tools=[{"type": "function",
+                        "function": {"name": "bash",
+                                     "description": "run cmd",
+                                     "parameters": {"type": "object",
+                                                    "properties": {"cmd": {"type": "string"}}}}}],
+                tool_choice="auto")
+t("tools passthrough encrypted", decrypt_blob(bt["tools"])[0]["name"] == "bash"
+  and "input_schema" in decrypt_blob(bt["tools"])[0]
+  and bt["tool_choice"] == {"type": "auto"})
+bt2 = build_body("glm-5.3-flash-free",
+                 [{"role": "assistant", "content": None,
+                   "tool_calls": [{"id": "call_1", "type": "function",
+                                   "function": {"name": "bash",
+                                                "arguments": "{\"cmd\":\"ls\"}"}}]},
+                  {"role": "tool", "tool_call_id": "call_1", "content": "x"}],
+                 "", "id4")
+in4 = decrypt_blob(bt2["messages"])
+t("assistant tool_calls rendered as text",
+  "[tool_call bash]" in " ".join(p.get("text", "") for p in in4[0]["content"]))
+t("tool results ride as user turns with name",
+  in4[1]["role"] == "user" and "[tool_result bash]" in
+  " ".join(p.get("text", "") for p in in4[1]["content"]))
+t("no tools upstream without tools", "tools" not in bt2)
 
 import server as S
 S._server_api_key = None
