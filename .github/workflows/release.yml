@@ -1,0 +1,81 @@
+name: Release
+on:
+  push:
+    branches: [main, master]
+    paths-ignore:
+      - "**.md"
+      - ".github/**"
+concurrency:
+  group: release
+  cancel-in-progress: false
+permissions:
+  contents: write
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.bump.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with: {fetch-depth: 0}
+      - id: bump
+        run: |
+          V=$(cat VERSION | tr -d '[:space:]')
+          IFS=. read -r MA MI PA <<< "$V"
+          NEW="$MA.$MI.$((PA+1))"
+          echo "$NEW" > VERSION
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add VERSION
+          git commit -m "chore: release $NEW [skip ci]" || true
+          git push || true
+          echo "version=$NEW" >> "$GITHUB_OUTPUT"
+  build:
+    needs: version
+    strategy:
+      matrix:
+        include:
+          - {os: windows-latest, name: windows-amd64}
+          - {os: ubuntu-latest,  name: linux-amd64}
+          - {os: macos-latest,   name: macos-arm64}
+          - {os: macos-15-intel, name: macos-x64}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.11"}
+      - run: pip install cryptography pyinstaller
+      - run: pyinstaller --onefile --name Verdent2API main.py
+      - name: smoke test
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            ./dist/Verdent2API.exe --help || true
+          else
+            chmod +x dist/Verdent2API
+            ./dist/Verdent2API --help || true
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: verdent2api-${{ matrix.name }}
+          path: |
+            dist/Verdent2API.exe
+            dist/Verdent2API
+  release:
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with: {path: dist, merge-multiple: true}
+      - name: rename artifacts
+        run: |
+          cd dist
+          mv Verdent2API.exe Verdent2API-${{ needs.version.outputs.version }}-windows-amd64.exe || true
+          [ -f Verdent2API ] && mv Verdent2API Verdent2API-${{ needs.version.outputs.version }}-linux-amd64 || true
+          ls -la
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.version.outputs.version }}
+          name: Verdent2API v${{ needs.version.outputs.version }}
+          files: dist/*
+          generate_release_notes: true

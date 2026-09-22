@@ -1,0 +1,18 @@
+# secrets / credentials
+auth.json
+*.token.json
+probe_result.json
+__pycache__/
+*.pyc
+
+# build artifacts
+build/
+dist/
+*.exe
+*.spec
+
+# editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
