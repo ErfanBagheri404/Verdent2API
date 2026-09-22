@@ -1,5 +1,5 @@
 """Verdent upstream client: builds /llm/stream envelopes, parses hybrid-stream responses."""
-import json, uuid, datetime, os, urllib.request, urllib.error
+import json, uuid, datetime, os, threading, urllib.request, urllib.error
 
 from crypto import encrypt_obj
 
@@ -113,38 +113,75 @@ def build_body(model, messages, system, token_id, max_tokens=None,
         body["temperature"] = temperature
     return body
 
-def stream_request(token, body, timeout=120):
+def stream_request(token, body, timeout=180):
     """POST /llm/stream, return (resp, resp). Raises UpstreamError.
 
-    Retries 500+need_retry (upstream's own "try again" flag, app behaves
-    the same) up to 3 times, honoring retryAfterMs capped at 30s.
-    ponytail: total retry budget ~60s; raise cap if free-window flaps longer.
+    Burst-proof against the gateway's RPM lane (20004):
+      * all upstream calls are serialized through one lock with >=1.2s gap
+        (the app only ever sends one prompt at a time — parallel hits are
+        what tripped the rate lane),
+      * 500/need_retry + 429 wait out real backoff (retryAfterMs, else
+        10/25/45s) instead of hammering,
+      * transport is direct first (same egress as the app), falling back to
+        the system proxy only on network errors.
+    ponytail: total worst-case wait ~80s; 9router test timeout is above that.
     """
+    import threading, time as _t
     data = json.dumps(body).encode("utf-8")
+    global _UP_GATE, _UP_LAST
     last = None
-    for attempt in range(3):
-        req = urllib.request.Request(BASE + STREAM_PATH, data=data,
-                                     headers=_headers(token), method="POST")
+    with _UP_GATE:
+        gap = _UP_LAST + 1.2 - _t.time()
+        if gap > 0:
+            _t.sleep(gap)
         try:
-            resp = urllib.request.urlopen(req, timeout=timeout)
-            return resp, resp
-        except urllib.error.HTTPError as e:
-            payload = e.read().decode("utf-8", "replace")[:500]
-            last = UpstreamError(e.code, payload)
-            retry_after_ms = None
-            if e.code in (500, 502, 503, 504):
+            _UP_LAST = _t.time()
+            for attempt in range(4):
+                req = urllib.request.Request(BASE + STREAM_PATH, data=data,
+                                             headers=_headers(token), method="POST")
                 try:
-                    j = json.loads(payload)
-                    if j.get("need_retry") is True:
-                        retry_after_ms = j.get("retryAfterMs") or j.get("retry_after_ms")
-                except Exception:
-                    pass
-            if retry_after_ms is None and e.code in (500, 502, 503, 504):
-                retry_after_ms = 1500 * (attempt + 1)
-            if retry_after_ms is None:
-                break  # 4xx: not retryable
-            wait = min(retry_after_ms, 30000) / 1000.0
-            if attempt < 2:
-                import time as _t
-                _t.sleep(wait)
+                    resp = _direct().open(req, timeout=timeout)
+                    return resp, resp
+                except urllib.error.HTTPError as e:
+                    payload = e.read().decode("utf-8", "replace")[:500]
+                    last = UpstreamError(e.code, payload)
+                    if e.code in (500, 502, 503, 504):
+                        wait_ms = None
+                        try:
+                            j = json.loads(payload)
+                            if j.get("need_retry") is True or "20004" in payload:
+                                wait_ms = j.get("retryAfterMs") or j.get("retry_after_ms")
+                        except Exception:
+                            pass
+                        if wait_ms is None:
+                            wait_ms = [10000, 25000, 45000][min(attempt, 2)]
+                        if attempt < 3:
+                            _t.sleep(min(int(wait_ms), 45000) / 1000.0)
+                            continue
+                    if e.code in (400, 401, 403, 404, 406, 429) and e.code != 429:
+                        raise
+                    break
+                except urllib.error.URLError:
+                    if attempt == 0:      # network/proxy failure -> system proxy once
+                        _UP_LAST = 0
+                        req2 = urllib.request.Request(BASE + STREAM_PATH, data=data,
+                                                      headers=_headers(token), method="POST")
+                        try:
+                            resp = urllib.request.urlopen(req2, timeout=timeout)
+                            return resp, resp
+                        except Exception as e2:
+                            last = UpstreamError(502, str(e2))
+                    break
+        finally:
+            _UP_LAST = _t.time()
     raise last from None
+
+
+_UP_GATE = threading.Lock()
+_UP_LAST = 0.0
+
+
+def _direct():
+    if not hasattr(_direct, "_opener"):
+        _direct._opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    return _direct._opener
