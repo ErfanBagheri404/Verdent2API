@@ -51,14 +51,24 @@ t("body uses fingerprinted app system blob", len(b["system"]) > 20000)
 t("body is_free mirrors app (false)", b["is_free"] is False)
 t("body session/conv prefix", b["session_id"].startswith("session_")
   and b["conv_id"].startswith("conv_"))
-t("body messages decryptable", decrypt_blob(b["messages"])[0]["content"] == "hi")
+inner = decrypt_blob(b["messages"])
+t("messages are app block arrays", isinstance(inner[0]["content"], list)
+  and inner[0]["content"][0]["type"] == "text"
+  and "<timestamp>" in inner[0]["content"][0]["text"])
+t("user text preserved in block", any(p.get("text") == "hi" for p in inner[0]["content"]))
+t("last block carries cache_control",
+  inner[-1]["content"][-1].get("cache_control") == {"type": "ephemeral"})
+t("assistant messages carry model", all(
+    m.get("model") for m in inner if m.get("role") == "assistant") if any(
+    m.get("role") == "assistant" for m in inner) else True)
 bsys = build_body("glm-5.3-flash-free",
                   [{"role": "system", "content": "be terse"},
                    {"role": "user", "content": "hi"}], "extra", "id2")
-inner = decrypt_blob(bsys["messages"])
+inner2 = decrypt_blob(bsys["messages"])
+first_txt = " ".join(p.get("text", "") for p in inner2[0]["content"])
 t("client system folded into first user msg",
-  inner[0]["role"] == "user" and "be terse" in inner[0]["content"]
-  and "extra" in inner[0]["content"] and "<system>" in inner[0]["content"])
+  inner2[0]["role"] == "user" and "be terse" in first_txt
+  and "extra" in first_txt and "<system>" in first_txt)
 h = _headers("tok")
 t("headers carry beta marker", h["verdent-proxy-beta"].startswith("hybrid-stream"))
 t("headers carry X-Team-ID", h["X-Team-ID"] == "0")

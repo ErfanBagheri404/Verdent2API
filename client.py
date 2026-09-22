@@ -74,12 +74,46 @@ def _template():
     return _TEMPLATE
 
 
+def _app_msg(m, last=False):
+    """App-shape message: content is an array of text blocks, first block is a
+    <timestamp>, cache_control on the final block of the final message.
+    Plain-string content is silently dropped upstream (model then answers a
+    hallucinated conversation — the 'PHP shipping data' bug)."""
+    c = m.get("content")
+    if isinstance(c, str):
+        parts = [c]
+    elif isinstance(c, list):
+        parts = []
+        for p in c:
+            if isinstance(p, str):
+                parts.append(p)
+            elif isinstance(p, dict):
+                t = p.get("text") or (p.get("content") if isinstance(p.get("content"), str) else None)
+                if t:
+                    parts.append(t)
+                elif p.get("type") in ("image_url", "image"):
+                    parts.append("[image omitted]")
+    else:
+        parts = [str(c)] if c is not None else []
+    off = datetime.datetime.now().astimezone().strftime("%z")  # +0330
+    ts = ("<timestamp>" + datetime.datetime.now().strftime("%a %b %d %Y %H:%M:%S GMT")
+          + off + "</timestamp>\n")
+    blocks = [{"type": "text", "text": ts}]
+    for t in parts:
+        blocks.append({"type": "text", "text": t})
+    if last:
+        blocks[-1]["cache_control"] = {"type": "ephemeral"}
+    out = {"role": m.get("role", "user"), "content": blocks}
+    if m.get("role") == "assistant":
+        out["model"] = m.get("model")
+    return out
+
+
 def build_body(model, messages, system, token_id, max_tokens=None,
                temperature=None, stream=True):
     t = _template()
     # OpenAI `system` messages can't go in body.system (fingerprinted) —
     # fold them into the conversation as a leading user-turn block.
-    msgs = []
     sys_parts = [m["content"] for m in messages
                  if m.get("role") == "system" and m.get("content")]
     if system:
@@ -93,6 +127,16 @@ def build_body(model, messages, system, token_id, max_tokens=None,
             msgs.insert(0, {"role": "user", "content": block})
     if not msgs:
         msgs = [{"role": "user", "content": "Hello"}]
+    # tool results ride as user turns (app has no role:"tool")
+    msgs = [{"role": "user" if m.get("role") == "tool" else m["role"],
+             "content": m.get("content")} if m.get("role") == "tool" else m
+            for m in msgs]
+    out_msgs = []
+    for i, m in enumerate(msgs):
+        mm = dict(m)
+        if mm.get("role") == "assistant" and not mm.get("model"):
+            mm["model"] = model
+        out_msgs.append(_app_msg(mm, last=(i == len(msgs) - 1)))
 
     body = dict(t)
     body.update({
@@ -103,7 +147,7 @@ def build_body(model, messages, system, token_id, max_tokens=None,
         "react_type": "Main Agent",
         "stream": stream,
         "max_tokens": max_tokens or t.get("max_tokens", 64000),
-        "messages": encrypt_obj(msgs),
+        "messages": encrypt_obj(out_msgs),
         "env": dict(t["env"], today_date=datetime.date.today().isoformat()),
     })
     body.pop("tools", None)
