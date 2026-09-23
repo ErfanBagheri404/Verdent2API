@@ -48,14 +48,16 @@ b = build_body("deepseek-v4.1-flash-free",
                [{"role": "user", "content": "hi"}], None, "id1")
 t("body has encrypt flag", b["encrypt"] is True)
 t("body uses fingerprinted app system blob", len(b["system"]) > 20000)
-t("body is_free mirrors app (false)", b["is_free"] is False)
+# account has zero credits: free lane forced True (30001 otherwise)
+t("body is_free forced to free lane", b["is_free"] is True)
 t("body session/conv prefix", b["session_id"].startswith("session_")
   and b["conv_id"].startswith("conv_"))
 inner = decrypt_blob(b["messages"])
 t("messages are app block arrays", isinstance(inner[0]["content"], list)
   and inner[0]["content"][0]["type"] == "text"
   and "<timestamp>" in inner[0]["content"][0]["text"])
-t("user text preserved in block", any(p.get("text") == "hi" for p in inner[0]["content"]))
+t("user text preserved in block",
+  any((p.get("text") or "").endswith("hi") for p in inner[0]["content"]))
 t("last block carries cache_control",
   inner[-1]["content"][-1].get("cache_control") == {"type": "ephemeral"})
 t("assistant messages carry model", all(
@@ -93,11 +95,13 @@ bt2 = build_body("glm-5.3-flash-free",
                   {"role": "tool", "tool_call_id": "call_1", "content": "x"}],
                  "", "id4")
 in4 = decrypt_blob(bt2["messages"])
+asst = [m for m in in4 if m["role"] == "assistant"][0]
+res = [m for m in in4 if m["role"] == "user"][-1]
 t("assistant tool_calls rendered as text",
-  "[tool_call bash]" in " ".join(p.get("text", "") for p in in4[0]["content"]))
+  "[tool_call bash]" in " ".join(p.get("text", "") for p in asst["content"]))
 t("tool results ride as user turns with name",
-  in4[1]["role"] == "user" and "[tool_result bash]" in
-  " ".join(p.get("text", "") for p in in4[1]["content"]))
+  "[tool_result bash]" in
+  " ".join(p.get("text", "") for p in res["content"]))
 t("no tools upstream without tools", "tools" not in bt2)
 
 import server as S

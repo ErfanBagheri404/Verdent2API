@@ -175,6 +175,14 @@ def build_body(model, messages, system, token_id, max_tokens=None,
                   "content": ("[tool_result %s]\n" % nm if nm else "[tool_result]\n") + c}
         norm.append(mm)
     msgs = norm
+    conv_tools = _conv_tools(tools)
+    if not conv_tools:
+        # Without a tool schema the model falls back to emitting raw
+        # tool-call markup (DSML) or roleplaying bash as text.
+        sys_parts.append("<tools>none available</tools> No tool-calling "
+                         "schema is present in this session: never emit "
+                         "tool-call markup (DSML/XML tags) or fake command "
+                         "output — answer directly in plain text.")
     if sys_parts:
         block = "<system>\n" + "\n\n".join(str(p) for p in sys_parts) + "\n</system>"
         if msgs and msgs[0].get("role") == "user" and isinstance(msgs[0].get("content"), str):
@@ -196,6 +204,10 @@ def build_body(model, messages, system, token_id, max_tokens=None,
 
     body = dict(t)
     body.update({
+        # Account runs in Free Mode (zero credits): the paid lane answers
+        # 30001 "out of credits", free lane answers 200. Captured template
+        # had is_free:false from a credited session — always force True.
+        "is_free": True,
         "model": model,
         "session_id": "session_" + str(uuid.uuid4()),
         "conv_id": "conv_" + str(uuid.uuid4()),
@@ -207,10 +219,16 @@ def build_body(model, messages, system, token_id, max_tokens=None,
         "env": dict(t["env"], today_date=datetime.date.today().isoformat()),
     })
     body.pop("sub_type", None)
-    conv_tools = _conv_tools(tools)
     if conv_tools:
         body["tools"] = encrypt_obj(conv_tools)
         body["tool_choice"] = _conv_tool_choice(tool_choice)
+    th = t.get("thinking")
+    if isinstance(th, dict) and th.get("budget_tokens"):
+        # budget > max_tokens starves the answer (empty content): the
+        # captured template reserves 4000 for thinking.
+        lim = max(1024, int(max_tokens or 4096) // 2)
+        if th["budget_tokens"] > lim and lim < th["budget_tokens"]:
+            body["thinking"] = dict(th, budget_tokens=lim)
     if temperature is not None:
         body["temperature"] = temperature
     return body

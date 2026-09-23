@@ -1,5 +1,5 @@
 """OpenAI-compatible HTTP server for Verdent2API."""
-import json, os, time, uuid, urllib.request
+import json, os, re, time, uuid, urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
@@ -44,6 +44,116 @@ def split_system(messages):
 
 def oai_err(status, code, msg):
     return status, json.dumps({"error": {"message": msg, "type": code}}).encode()
+
+# When the tool schema is dropped upstream (capacity stripping, model
+# lapsing), the model imitates our history format and writes tool calls as
+# plain text: "[tool_call name] {json}" or DSML invoke markup. The heal
+# parser below converts both back into structured tool_calls.
+_MARKERS = ("[tool_call", "<｜｜DSML｜｜")
+_TC_SPAN = re.compile(r"\[tool_call ([A-Za-z0-9_./-]+)\]\s*(\{)")
+_DSML_RE = re.compile(r'<｜｜DSML｜｜ invoke name="([^"]+)">(.*?)</｜｜DSML｜｜ invoke>', re.S)
+_DSML_PARAM = re.compile(r'<｜｜DSML｜｜ parameter name="([^"]+)"[^>]*>(.*?)</｜｜DSML｜｜ parameter>', re.S)
+
+_TS_RE = re.compile(r"<timestamp>[^<]*</timestamp>\s*")
+
+def _strip_ts(text):
+    """Model sometimes echoes Hermes's <timestamp> context marker as its own
+    output (bare date lines). It belongs in prompts, not responses."""
+    return _TS_RE.sub("", text)
+
+def marker_at_or_after(s, pos):
+    """First marker start (full, or partial at end) at/after pos, else None."""
+    for m in _MARKERS:
+        i = s.find(m, pos)
+        if i != -1:
+            return i
+        for k in range(1, len(m)):
+            if s.endswith(m[:k]) and len(s) - k >= pos:
+                return len(s) - k
+    return None
+
+def _tolerant_args(tool, args):
+    """Strict JSON first; on failure repair the common model slip — raw code
+    pasted with real newlines/quotes inside a pseudo-JSON arg block.
+    Hermes executes code args, so the value only needs to survive as a
+    string, not as valid JSON on the wire."""
+    try:
+        json.loads(args)
+        return args
+    except Exception:
+        pass
+    # key scan: "param" : value up to the next key or block end
+    out = {}
+    keys = [(mm.start(1), mm.group(1)) for mm in
+            re.finditer(r'"([A-Za-z_][A-Za-z0-9_]*)"\\s*:', args)]
+    if not keys:
+        return None
+    for idx, (pos, key) in enumerate(keys):
+        vstart = args.index(":", pos) + 1
+        vend = keys[idx + 1][0] if idx + 1 < len(keys) else len(args)
+        val = args[vstart:vend].strip().rstrip(",").strip()
+        # strip one outer quote pair, keep the interior verbatim
+        if len(val) >= 2 and val[0] == '"' and val[-1] == '"':
+            val = val[1:-1]
+        elif val.startswith('"""') or val.endswith('"""'):
+            val = val.strip('"')
+        # unescape the \\n lits the model uses for newlines inside strings
+        val = val.replace("\\\\n", "\n").replace("\\\\t", "\t").replace("\\\\\\\\", "\\\\")
+        out[key] = val
+    if not out:
+        return None
+    return json.dumps(out, ensure_ascii=False)
+
+def _parse_text_tool_calls(text):
+    """Return (calls, cleaned_text) with markup spans removed."""
+    calls, spans = [], []
+    for m in _TC_SPAN.finditer(text):
+        start = m.end(2) - 1
+        # Brace-depth scanning is wrong here: the args string legitimately
+        # contains unbalanced Kotlin/JS braces. Region = this call to the next
+        # marker, then cut at each '}' and keep the first parse that works.
+        region_end = text.find("[tool_call", m.end(2))
+        if region_end == -1:
+            region_end = len(text)
+        region = text[start:region_end]
+        cands = [k + 1 for k, ch in enumerate(region) if ch == "}"]
+        arg_str, end = None, None
+        for e in cands:
+            try:
+                json.loads(region[:e])
+                arg_str, end = region[:e], start + e
+                break
+            except Exception:
+                pass
+        if arg_str is None:
+            for e in reversed(cands):
+                p = _tolerant_args(m.group(1), region[:e])
+                if p is not None:
+                    arg_str, end = p, start + e
+                    break
+        if arg_str is None:
+            continue
+        calls.append({"id": "call_" + uuid.uuid4().hex[:16], "type": "function",
+                      "function": {"name": m.group(1), "arguments": arg_str}})
+        spans.append((m.start(), end))
+    for m in _DSML_RE.finditer(text):
+        params = {p.group(1): p.group(2)
+                  for p in _DSML_PARAM.finditer(m.group(2))}
+        if not params:
+            continue
+        calls.append({"id": "call_" + uuid.uuid4().hex[:16], "type": "function",
+                      "function": {"name": m.group(1),
+                                   "arguments": json.dumps(params, ensure_ascii=False)}})
+        spans.append(m.span())
+    if not calls:
+        return [], text
+    spans.sort()
+    out, last = [], 0
+    for a, b in spans:
+        out.append(text[last:a])
+        last = b
+    out.append(text[last:])
+    return calls, "".join(out)
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
@@ -123,6 +233,8 @@ class Handler(BaseHTTPRequestHandler):
             s, b = oai_err(st, "upstream_error", f"{e.payload[:300]}")
             return self._send(s, b)
         ct = resp.headers.get("content-type", "")
+        print(f"[req] model={model} tools={len(req.get('tools') or [])} "
+              f"stream={bool(req.get('stream'))} sse={'event-stream' in ct}", flush=True)
         if "event-stream" in ct:
             self._relay_sse(reader, req, model, want_stream=bool(req.get("stream")))
         else:
@@ -145,6 +257,12 @@ class Handler(BaseHTTPRequestHandler):
         finish = "stop"
         usage_in = usage_out = 0
         done = False
+        # Live text goes out until a tool-markup marker appears; from there
+        # we hold back so the healed parse can emit real tool_calls instead
+        # of raw markup. client sent tools -> parse eligible.
+        client_tools = bool(req.get("tools"))
+        emitted_chars = 0
+        suppress = False
 
         def emit(obj):
             data = ("data: " + json.dumps(obj, ensure_ascii=False) + "\n\n").encode()
@@ -200,9 +318,23 @@ class Handler(BaseHTTPRequestHandler):
                         dt = d.get("type")
                         if dt == "text_delta":
                             piece = d.get("text", "")
+                            if not suppress:
+                                cand = "".join(text) + piece
+                                hit = (marker_at_or_after(cand, emitted_chars)
+                                       if client_tools else None)
+                                if hit is None and emitted_chars == 0:
+                                    # response starting with a <timestamp> echo
+                                    for k in range(1, 12):
+                                        if cand.startswith("<timestamp>"[:k]):
+                                            hit = 0
+                                            break
+                                if hit is not None:
+                                    suppress = True
+                                    emitted_chars = len("".join(text))
                             text.append(piece)
-                            if want_stream:
+                            if want_stream and not suppress:
                                 emit(chunk({"content": piece}))
+                                emitted_chars += len(piece)
                         elif dt == "thinking_delta":
                             reasoning.append(d.get("thinking", ""))
                         elif dt in ("input_json_delta", "arguments_delta"):
@@ -218,8 +350,19 @@ class Handler(BaseHTTPRequestHandler):
                         if sr == "tool_use":
                             finish = "tool_calls"
                     elif t == "message_stop":
+                        # Real usage arrives only here (message_start
+                        # carries a placeholder input_tokens:0).
+                        u = obj.get("usage") or {}
+                        usage_in = u.get("input_tokens") or usage_in
+                        usage_out = u.get("output_tokens") or usage_out
                         done = True
             # final assembled chunk (always emit terminal)
+            final_text = _strip_ts("".join(text))
+            calls = []
+            if client_tools and not tool_acc:
+                # Tool schema was dropped upstream and the model wrote the
+                # call as text markup — heal it back into structured calls.
+                calls, final_text = _parse_text_tool_calls(final_text)
             delta = {}
             if tool_acc:
                 delta["tool_calls"] = [
@@ -228,11 +371,26 @@ class Handler(BaseHTTPRequestHandler):
                                   "arguments": tool_acc[i]["args"]}}
                     for i in sorted(tool_acc)]
                 finish = "tool_calls"
+            elif calls:
+                delta["tool_calls"] = calls
+                finish = "tool_calls"
             if want_stream:
                 if reasoning:
                     emit(chunk({"reasoning_content": "".join(reasoning)}))
+                if suppress and len(final_text) > emitted_chars:
+                    # held-back narration (markup spans already stripped)
+                    emit(chunk({"content": final_text[emitted_chars:]}))
                 emit(chunk(delta, finish))
-                emit(chunk({}, None) if False else b"data: [DONE]\n\n")
+                # usage chunk: empty choices + usage (OpenAI include_usage)
+                uc = {"id": cid, "object": "chat.completion.chunk",
+                      "created": created, "model": model, "choices": [],
+                      "usage": {"prompt_tokens": usage_in,
+                                "completion_tokens": usage_out,
+                                "total_tokens": usage_in + usage_out}}
+                emit(uc)
+                # [DONE] must be a proper chunk, not raw bytes
+                done_pay = b"data: [DONE]\n\n"
+                self.wfile.write(("%x\r\n" % len(done_pay)).encode() + done_pay + b"\r\n")
                 self.wfile.write(b"0\r\n\r\n")
             else:
                 out = {
@@ -241,14 +399,15 @@ class Handler(BaseHTTPRequestHandler):
                     "choices": [{"index": 0,
                                  "finish_reason": finish,
                                  "message": {"role": "assistant",
-                                             "content": "".join(text) or None,
+                                             "content": final_text or None,
                                              **({"reasoning_content": "".join(reasoning)}
                                                 if reasoning else {}),
-                                             **({"tool_calls": [
+                                             **({"tool_calls":
+                                                 (calls if not tool_acc else [
                                                  {"id": tool_acc[i]["id"], "type": "function",
                                                   "function": {"name": tool_acc[i]["name"],
                                                                "arguments": tool_acc[i]["args"]}}
-                                                 for i in sorted(tool_acc)]} if tool_acc else {})}}],
+                                                 for i in sorted(tool_acc)])} if (tool_acc or calls) else {})}}],
                     "usage": {"prompt_tokens": usage_in, "completion_tokens": usage_out,
                               "total_tokens": usage_in + usage_out},
                 }
@@ -290,12 +449,17 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(s, b)
         text = "".join(b.get("text", "") for b in d.get("content", [])
                        if b.get("type") == "text")
+        calls = []
+        text = _strip_ts(text)
+        if req.get("tools"):
+            calls, text = _parse_text_tool_calls(text)
         u = d.get("usage") or {}
         out = {
             "id": "chatcmpl-" + uuid.uuid4().hex[:24], "object": "chat.completion",
             "created": int(time.time()), "model": model,
-            "choices": [{"index": 0, "finish_reason": d.get("stop_reason") or "stop",
-                         "message": {"role": "assistant", "content": text or None}}],
+            "choices": [{"index": 0, "finish_reason": "tool_calls" if calls else (d.get("stop_reason") or "stop"),
+                         "message": {"role": "assistant", "content": text or None,
+                                     **({"tool_calls": calls} if calls else {})}}],
             "usage": {"prompt_tokens": u.get("input_tokens", 0),
                       "completion_tokens": u.get("output_tokens", 0),
                       "total_tokens": u.get("input_tokens", 0) + u.get("output_tokens", 0)},
